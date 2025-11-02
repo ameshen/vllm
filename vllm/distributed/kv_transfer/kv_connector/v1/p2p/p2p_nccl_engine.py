@@ -31,6 +31,17 @@ from vllm.utils.torch_utils import current_stream
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# DEBUG BREAKPOINTS - Set VLLM_P2P_DEBUG=1 to enable detailed logging
+# ============================================================================
+_DEBUG_P2P = os.getenv("VLLM_P2P_DEBUG", "0") == "1"
+
+def _debug_log(rank: int, location: str, **kwargs):
+    """Helper function for debug logging."""
+    if _DEBUG_P2P:
+        details = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+        logger.info(f"🔍 [Rank {rank}] {location} | {details}")
+
 DEFAULT_MEM_POOL_SIZE_GB = 32
 
 
@@ -86,6 +97,10 @@ class P2pNcclEngine:
         self.device = torch.device(f"cuda:{self.local_rank}")
         self.nccl = NCCLLibrary(library_path)
 
+        # 🔍 DEBUG BREAKPOINT 1: Engine Initialization
+        _debug_log(self.rank, "P2pNcclEngine.__init__ START",
+                   local_rank=local_rank, pid=os.getpid())
+
         if not hostname:
             hostname = get_ip()
         port = int(self.config.kv_port) + port_offset
@@ -96,6 +111,10 @@ class P2pNcclEngine:
 
         # Each card corresponds to a ZMQ address.
         self.zmq_address = f"{self._hostname}:{self._port}"
+
+        # 🔍 DEBUG BREAKPOINT 2: ZMQ Address
+        _debug_log(self.rank, "ZMQ address configured",
+                   zmq_address=self.zmq_address)
 
         # If `proxy_ip` or `proxy_port` is `""`,
         # then the ping thread will not be enabled.
@@ -125,6 +144,10 @@ class P2pNcclEngine:
         self.context = zmq.Context()
         self.router_socket = self.context.socket(zmq.ROUTER)
         self.router_socket.bind(f"tcp://{self.zmq_address}")
+
+        # 🔍 DEBUG BREAKPOINT 3: ZMQ Router Socket Bound
+        _debug_log(self.rank, "ZMQ Router socket bound successfully",
+                   address=self.zmq_address)
 
         self.poller = zmq.Poller()
         self.poller.register(self.router_socket, zmq.POLLIN)
@@ -180,6 +203,11 @@ class P2pNcclEngine:
         )
         self._listener_thread.start()
 
+        # 🔍 DEBUG BREAKPOINT 4: Listener Thread Started
+        _debug_log(self.rank, "Listener thread started",
+                   thread_name=self._listener_thread.name,
+                   thread_alive=self._listener_thread.is_alive())
+
         self._ping_thread = None
         if port_offset == 0 and self.proxy_address != "":
             self._ping_thread = threading.Thread(target=self.ping, daemon=True)
@@ -200,12 +228,22 @@ class P2pNcclEngine:
         )
 
     def create_connect(self, remote_address: str | None = None):
+        # 🔍 DEBUG BREAKPOINT 5: create_connect START
+        _debug_log(self.rank, "create_connect START",
+                   remote_address=remote_address,
+                   existing_comms=list(self.comms.keys()))
+
         assert remote_address is not None
         if remote_address not in self.socks:
             sock = self.context.socket(zmq.DEALER)
             sock.setsockopt_string(zmq.IDENTITY, self.zmq_address)
             sock.connect(f"tcp://{remote_address}")
             self.socks[remote_address] = sock
+
+            # 🔍 DEBUG BREAKPOINT 6: ZMQ DEALER Connected
+            _debug_log(self.rank, "ZMQ DEALER connected",
+                       remote_address=remote_address)
+
             if remote_address in self.comms:
                 logger.info(
                     "👋comm exists, remote_address:%s, comms:%s",
@@ -216,12 +254,31 @@ class P2pNcclEngine:
 
             unique_id = self.nccl.ncclGetUniqueId()
             data = {"cmd": "NEW", "unique_id": bytes(unique_id.internal)}
+
+            # 🔍 DEBUG BREAKPOINT 7: Sending NEW command
+            _debug_log(self.rank, "Sending NEW command via ZMQ",
+                       remote_address=remote_address,
+                       unique_id_hex=bytes(unique_id.internal)[:16].hex())
+
             sock.send(msgpack.dumps(data))
 
             with torch.cuda.device(self.device):
                 rank = 0
+
+                # 🔍 DEBUG BREAKPOINT 8: CRITICAL - About to call ncclCommInitRank (PREFILL)
+                # This is a COLLECTIVE operation that WILL HANG if decode side is not ready!
+                _debug_log(self.rank, "⚠️ PREFILL: About to call ncclCommInitRank",
+                           nprocs=2, my_rank=0, remote_address=remote_address)
+                logger.warning(f"🚨 [Rank {self.rank}] ENTERING ncclCommInitRank - "
+                              f"This will block until decode side also calls it!")
+
                 with set_p2p_nccl_context(self.nccl_num_channels):
                     comm: ncclComm_t = self.nccl.ncclCommInitRank(2, unique_id, rank)
+
+                # 🔍 DEBUG BREAKPOINT 9: ncclCommInitRank SUCCESS (PREFILL)
+                _debug_log(self.rank, "✅ PREFILL: ncclCommInitRank SUCCESS",
+                           remote_address=remote_address)
+
                 self.comms[remote_address] = (comm, rank)
                 logger.info(
                     "🤝ncclCommInitRank Success, %s👉%s, MyRank:%s",
@@ -368,6 +425,10 @@ class P2pNcclEngine:
         return tensor
 
     def listen_for_requests(self):
+        # 🔍 DEBUG BREAKPOINT 10: Listener thread running
+        _debug_log(self.rank, "Listener thread RUNNING, starting to poll",
+                   zmq_address=self.zmq_address)
+
         while True:
             socks = dict(self.poller.poll())
             if self.router_socket not in socks:
@@ -376,13 +437,32 @@ class P2pNcclEngine:
             remote_address, message = self.router_socket.recv_multipart()
             data = msgpack.loads(message)
             if data["cmd"] == "NEW":
+                # 🔍 DEBUG BREAKPOINT 11: Received NEW command (DECODE)
+                _debug_log(self.rank, "✉️ DECODE: Received NEW command",
+                           remote_address=remote_address.decode(),
+                           unique_id_hex=bytes(data["unique_id"])[:16].hex())
+
                 unique_id = self.nccl.unique_id_from_bytes(bytes(data["unique_id"]))
                 with torch.cuda.device(self.device):
                     rank = 1
+
+                    # 🔍 DEBUG BREAKPOINT 12: CRITICAL - About to call ncclCommInitRank (DECODE)
+                    # This is a COLLECTIVE operation that WILL HANG if prefill side is not ready!
+                    _debug_log(self.rank, "⚠️ DECODE: About to call ncclCommInitRank",
+                               nprocs=2, my_rank=1,
+                               remote_address=remote_address.decode())
+                    logger.warning(f"🚨 [Rank {self.rank}] ENTERING ncclCommInitRank - "
+                                  f"This will block until prefill side completes!")
+
                     with set_p2p_nccl_context(self.nccl_num_channels):
                         comm: ncclComm_t = self.nccl.ncclCommInitRank(
                             2, unique_id, rank
                         )
+
+                    # 🔍 DEBUG BREAKPOINT 13: ncclCommInitRank SUCCESS (DECODE)
+                    _debug_log(self.rank, "✅ DECODE: ncclCommInitRank SUCCESS",
+                               remote_address=remote_address.decode())
+
                     self.comms[remote_address.decode()] = (comm, rank)
                     logger.info(
                         "🤝ncclCommInitRank Success, %s👈%s, MyRank:%s",
